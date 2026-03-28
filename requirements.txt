@@ -1,0 +1,5 @@
+numpy>=1.26,<3
+openai-whisper>=20250625
+pyobjc-framework-Cocoa>=12.1; sys_platform == "darwin"
+sounddevice>=0.5,<1
+soundfile>=0.12,<1
