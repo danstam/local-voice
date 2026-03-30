@@ -506,6 +506,24 @@ class DictationApp:
         self.root.clipboard_append(text)
         self._set_status("Copied", GREEN)
 
+    def cancel_clicked(self) -> None:
+        if (not self.recording and not self.paused) or self.recording_session is None:
+            return
+
+        session = self.recording_session
+        self.recording_session = None
+        self.recording = False
+        self.paused = False
+        try:
+            self.recorder.stop()
+        except Exception:
+            pass
+        self.recorder.clear()
+        session.stop_requested.set()
+        self._set_status("Ready", GREEN)
+        self._ensure_idle_text()
+        self._refresh_buttons()
+
     def quit_clicked(self) -> None:
         if self.recording or self.paused:
             try:
@@ -699,7 +717,12 @@ class DictationApp:
         record_role = "record" if self.paused or not self.recording else "secondary"
         self._style_button(self.record_button, record_title, record_role, self.model_ready and not busy)
         self._style_button(self.stop_button, "Stop", "stop", self.recording or self.paused)
-        self._style_button(self.copy_button, "Copy", "secondary", can_copy)
+        if self.recording or self.paused:
+            self.copy_button.command = self.cancel_clicked
+            self._style_button(self.copy_button, "Cancel", "secondary", True)
+        else:
+            self.copy_button.command = self.copy_clicked
+            self._style_button(self.copy_button, "Copy", "secondary", can_copy)
         self._style_button(self.quit_button, "Quit", "ghost", True)
         self._refresh_model_selector()
         self._refresh_translation_toggle()

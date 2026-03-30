@@ -188,6 +188,24 @@ class AppDelegate(NSObject):
         pasteboard.setString_forType_(text, NSPasteboardTypeString)
         self._set_status("Copied", self._green())
 
+    def cancelClicked_(self, sender) -> None:
+        if (not self.recording and not self.paused) or self.recordingSession is None:
+            return
+
+        session = self.recordingSession
+        self.recordingSession = None
+        self.recording = False
+        self.paused = False
+        try:
+            self.recorder.stop()
+        except Exception:
+            pass
+        self.recorder.clear()
+        session.stop_requested.set()
+        self._set_status("Ready", self._green())
+        self._ensure_idle_text()
+        self._refresh_buttons()
+
     def quitClicked_(self, sender) -> None:
         NSApplication.sharedApplication().terminate_(None)
 
@@ -637,7 +655,12 @@ class AppDelegate(NSObject):
         record_role = "record" if self.paused or not self.recording else "secondary"
         self._style_button(self.recordButton, record_title, record_role, self.model_ready and not busy)
         self._style_button(self.stopButton, "Stop", "stop", self.recording or self.paused)
-        self._style_button(self.copyButton, "Copy", "secondary", can_copy)
+        if self.recording or self.paused:
+            self.copyButton.setAction_("cancelClicked:")
+            self._style_button(self.copyButton, "Cancel", "secondary", True)
+        else:
+            self.copyButton.setAction_("copyClicked:")
+            self._style_button(self.copyButton, "Copy", "secondary", can_copy)
         self._style_button(self.quitButton, "×", "ghost", True)
         self._refresh_model_selector()
         self._refresh_translation_toggle()
