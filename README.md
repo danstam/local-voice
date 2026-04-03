@@ -24,7 +24,7 @@ The widget runs as a floating panel that stays on top of other windows. On macOS
 
 - Python 3.10 or higher
 - Git
-- ffmpeg — install via `brew install ffmpeg` on macOS, or `winget install Gyan.FFmpeg` on Windows
+- ffmpeg — macOS only: `brew install ffmpeg` (Windows installer handles this automatically)
 
 ---
 

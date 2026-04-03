@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 
 echo.
 echo   Welcome to Local Voice
@@ -8,6 +8,7 @@ echo   Speech to text, fully offline.
 echo.
 echo   This installer will:
 echo     - Create a Python virtual environment
+echo     - Detect your hardware and install the right version of PyTorch
 echo     - Install dependencies (includes PyTorch, ~2 GB)
 echo     - Download a Whisper transcription model
 echo.
@@ -28,11 +29,17 @@ if %py_version% LSS 310 (
   exit /b 1
 )
 
-:: Check ffmpeg
-where ffmpeg >nul 2>&1
+:: Check / auto-install ffmpeg
+ffmpeg -version >nul 2>&1
 if errorlevel 1 (
-  echo ffmpeg is not installed. Please run: winget install Gyan.FFmpeg
-  exit /b 1
+  echo ffmpeg not found. Installing via winget...
+  winget install -e --id Gyan.FFmpeg --accept-package-agreements --accept-source-agreements
+  echo.
+  echo ffmpeg was just installed. If the app fails to process audio later,
+  echo close this window and run install.bat again so Windows picks up the new PATH.
+  echo.
+) else (
+  echo ffmpeg is already installed.
 )
 
 :: Create virtual environment
@@ -43,9 +50,29 @@ if exist ".venv" (
   python -m venv .venv
 )
 
-:: Install requirements
-echo Installing dependencies...
-.venv\Scripts\pip.exe install -r requirements.txt
+:: Activate and upgrade pip
+call .venv\Scripts\activate.bat
+echo Upgrading pip...
+python -m pip install --upgrade pip >nul
+
+echo.
+echo Detecting hardware...
+
+:: Install the right PyTorch build before requirements so openai-whisper
+:: does not pull in the CUDA build as a transitive dependency on CPU-only machines.
+nvidia-smi >nul 2>&1
+if %errorlevel% equ 0 (
+  echo NVIDIA GPU detected. Installing GPU-accelerated PyTorch...
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+) else (
+  echo No NVIDIA GPU detected. Installing CPU-only PyTorch...
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+)
+
+:: Install remaining dependencies
+echo.
+echo Installing remaining dependencies...
+pip install -r requirements.txt
 
 :: Model selection menu
 echo.
@@ -70,7 +97,7 @@ if not defined model (
 
 echo.
 echo Downloading model: %model%
-.venv\Scripts\python.exe -m local_voice.app_windows --download-model %model%
+python -m local_voice.app_windows --download-model %model%
 if errorlevel 1 (
   echo Model download failed. Check your internet connection and try again.
   exit /b 1
