@@ -22,9 +22,8 @@ The widget runs as a floating panel that stays on top of other windows. On macOS
 
 ## Prerequisites
 
-- Python 3.10 or higher
 - Git
-- ffmpeg — macOS only: `brew install ffmpeg` (Windows installer handles this automatically)
+- macOS only: [Homebrew](https://brew.sh) — the installer uses it to set up Python and ffmpeg automatically
 
 ---
 
