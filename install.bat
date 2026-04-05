@@ -7,7 +7,8 @@ echo   -------------------------
 echo   Speech to text, fully offline.
 echo.
 echo   This installer will:
-echo     - Create a Python virtual environment
+echo     - Install Python 3.12 if needed
+echo     - Install ffmpeg if needed
 echo     - Detect your hardware and install the right version of PyTorch
 echo     - Install dependencies (includes PyTorch, ~2 GB)
 echo     - Download a Whisper transcription model
@@ -15,66 +16,102 @@ echo.
 pause
 echo.
 
-:: Check Python
 where python >nul 2>&1
-if errorlevel 1 (
-  echo Python is not installed. Please install Python 3.10 or higher from https://www.python.org and try again.
-  exit /b 1
-)
-
-:: Check Python version 3.10+
+if errorlevel 1 goto no_python
 for /f "tokens=*" %%v in ('python -c "import sys; print(sys.version_info.major * 100 + sys.version_info.minor)"') do set py_version=%%v
-if %py_version% LSS 310 (
-  echo Python 3.10 or higher is required. Please upgrade and try again.
-  exit /b 1
-)
+if !py_version! GEQ 310 goto python_ok
 
-:: Check / auto-install ffmpeg
+:no_python
+echo Python 3.10 or higher not found. Installing Python 3.12...
+where winget >nul 2>&1
+if not errorlevel 1 (
+  winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+) else (
+  echo winget not available. Downloading Python 3.12 installer...
+  powershell -Command "Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe' -OutFile '%TEMP%\python_installer.exe'"
+  "%TEMP%\python_installer.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_tcltk=1
+  del "%TEMP%\python_installer.exe" >nul 2>&1
+)
+echo.
+echo Python was just installed. Please close this window and run install.bat again.
+pause
+exit /b 0
+
+:python_ok
+echo Python !py_version! found.
+
 ffmpeg -version >nul 2>&1
-if errorlevel 1 (
-  echo ffmpeg not found. Installing via winget...
+if not errorlevel 1 goto ffmpeg_ok
+
+echo ffmpeg not found. Installing...
+where winget >nul 2>&1
+if not errorlevel 1 (
   winget install -e --id Gyan.FFmpeg --accept-package-agreements --accept-source-agreements
   echo.
   echo ffmpeg was just installed. If the app fails to process audio later,
   echo close this window and run install.bat again so Windows picks up the new PATH.
   echo.
 ) else (
-  echo ffmpeg is already installed.
+  echo winget not available. Downloading ffmpeg...
+  powershell -Command "Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip' -OutFile '%TEMP%\ffmpeg.zip'"
+  powershell -Command "Expand-Archive -Path '%TEMP%\ffmpeg.zip' -DestinationPath '%TEMP%\ffmpeg_extracted' -Force"
+  if not exist "ffmpeg" mkdir ffmpeg
+  powershell -Command "Copy-Item -Path (Get-ChildItem '%TEMP%\ffmpeg_extracted\*\bin\ffmpeg.exe').FullName -Destination 'ffmpeg\ffmpeg.exe'"
+  del "%TEMP%\ffmpeg.zip" >nul 2>&1
+  rmdir /s /q "%TEMP%\ffmpeg_extracted" >nul 2>&1
+  set "PATH=%~dp0ffmpeg;%PATH%"
+  echo ffmpeg installed to project folder.
 )
 
-:: Create virtual environment
+:ffmpeg_ok
+
 if exist ".venv" (
-  echo Virtual environment already exists, skipping.
-) else (
-  echo Creating virtual environment...
-  python -m venv .venv
+  ".venv\Scripts\python.exe" -c "import torch" >nul 2>&1
+  if errorlevel 1 (
+    echo Existing environment is incomplete or broken. Rebuilding...
+    rmdir /s /q .venv
+    goto create_venv
+  )
+  echo Existing environment looks healthy, skipping reinstall.
+  goto model_select
 )
 
-:: Activate and upgrade pip
+:create_venv
+echo Creating virtual environment...
+python -m venv .venv
+if errorlevel 1 (
+  echo Failed to create virtual environment.
+  exit /b 1
+)
+
 call .venv\Scripts\activate.bat
 echo Upgrading pip...
 python -m pip install --upgrade pip >nul
 
 echo.
 echo Detecting hardware...
-
-:: Install the right PyTorch build before requirements so openai-whisper
-:: does not pull in the CUDA build as a transitive dependency on CPU-only machines.
 nvidia-smi >nul 2>&1
 if %errorlevel% equ 0 (
   echo NVIDIA GPU detected. Installing GPU-accelerated PyTorch...
-  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 ) else (
   echo No NVIDIA GPU detected. Installing CPU-only PyTorch...
   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 )
+if errorlevel 1 (
+  echo PyTorch installation failed. Check your internet connection and try again.
+  exit /b 1
+)
 
-:: Install remaining dependencies
 echo.
-echo Installing remaining dependencies...
+echo Installing dependencies...
 pip install -r requirements.txt
+if errorlevel 1 (
+  echo Dependency installation failed. Check your internet connection and try again.
+  exit /b 1
+)
 
-:: Model selection menu
+:model_select
 echo.
 echo Select a model to download:
 echo.
@@ -97,7 +134,7 @@ if not defined model (
 
 echo.
 echo Downloading model: %model%
-python -m local_voice.app_windows --download-model %model%
+.venv\Scripts\python.exe -m local_voice.app_windows --download-model %model%
 if errorlevel 1 (
   echo Model download failed. Check your internet connection and try again.
   exit /b 1

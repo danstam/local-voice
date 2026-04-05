@@ -7,7 +7,8 @@ echo "  ────────────────────────
 echo "  Speech to text, fully offline."
 echo ""
 echo "  This installer will:"
-echo "    • Create a Python virtual environment"
+echo "    • Install Python 3.12 if needed"
+echo "    • Install ffmpeg if needed"
 echo "    • Install dependencies (includes PyTorch, ~2 GB)"
 echo "    • Download a Whisper transcription model"
 echo ""
@@ -15,42 +16,65 @@ printf "  Press Enter to continue..."
 read -r _
 echo ""
 
-# Check Python 3.10+
 if ! command -v python3 &>/dev/null; then
-  echo "Python 3 is not installed. Please install Python 3.10 or higher from https://www.python.org and try again."
-  exit 1
+  if command -v brew &>/dev/null; then
+    echo "Python not found. Installing via Homebrew..."
+    brew install python@3.12
+    export PATH="$(brew --prefix python@3.12)/bin:$PATH"
+  else
+    echo "Python 3.10 or higher is required."
+    echo "Install Homebrew first (https://brew.sh), then run: brew install python@3.12"
+    exit 1
+  fi
 fi
 
 py_version=$(python3 -c "import sys; print(sys.version_info.major * 100 + sys.version_info.minor)")
 if (( py_version < 310 )); then
-  echo "Python 3.10 or higher is required. You have $(python3 --version). Please upgrade and try again."
-  exit 1
+  if command -v brew &>/dev/null; then
+    echo "Python $(python3 --version) is too old. Installing Python 3.12 via Homebrew..."
+    brew install python@3.12
+    export PATH="$(brew --prefix python@3.12)/bin:$PATH"
+  else
+    echo "Python 3.10 or higher is required. You have $(python3 --version)."
+    echo "Install Homebrew (https://brew.sh) then run: brew install python@3.12"
+    exit 1
+  fi
 fi
 
-# Check ffmpeg
+echo "Python $(python3 --version) found."
+
 if ! command -v ffmpeg &>/dev/null; then
-  echo "ffmpeg is not installed."
-  echo "If you have Homebrew, run: brew install ffmpeg"
-  echo "If you don't have Homebrew, install it first from https://brew.sh, then run: brew install ffmpeg"
-  exit 1
+  if command -v brew &>/dev/null; then
+    echo "Installing ffmpeg via Homebrew..."
+    brew install ffmpeg
+  else
+    echo "ffmpeg is required but not installed."
+    echo "Install Homebrew first (https://brew.sh), then run: brew install ffmpeg"
+    exit 1
+  fi
 fi
 
-# Create virtual environment
 if [[ -d ".venv" ]]; then
-  echo "Virtual environment already exists, skipping."
-else
+  if ! .venv/bin/python -c "import torch" &>/dev/null; then
+    echo "Existing environment is incomplete or broken. Rebuilding..."
+    rm -rf .venv
+  else
+    echo "Existing environment looks healthy, skipping reinstall."
+    goto_model_select=1
+  fi
+fi
+
+if [[ -z "${goto_model_select:-}" ]]; then
   echo "Creating virtual environment..."
   python3 -m venv .venv
+
+  echo "Installing dependencies..."
+  .venv/bin/pip install --upgrade pip --quiet
+  .venv/bin/pip install -r requirements.txt
 fi
 
-# Install requirements
-echo "Installing dependencies..."
-.venv/bin/pip install -r requirements.txt
-
-# Make launcher executable
 chmod +x voice
 
-# Model selection menu
 echo ""
 echo "Select a model to download:"
 echo ""
