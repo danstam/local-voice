@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import gc
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
-import ssl
 import subprocess
 import sys
 import threading
+import tempfile
+from types import SimpleNamespace
 from datetime import datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
 
 from .paths import app_data_dir
+from .inference import InferenceClient
+from .settings import read_settings, write_settings
 
 MODEL_OPTIONS = ["turbo", "large-v3", "medium", "small"]
 MODEL_TITLES = {
@@ -25,11 +26,19 @@ MODEL_TITLES = {
     "small": "Small",
 }
 TRANSLATION_MODEL_OPTIONS = {"large-v3", "medium"}
-DEFAULT_MODEL = "small"
+DEFAULT_MODEL = "turbo"
 APP_DIR = app_data_dir()
 SETTINGS_PATH = APP_DIR / "settings.json"
 MODEL_DIR = APP_DIR / "models"
 OVERLAP_WORD_LIMIT = 80
+LANGUAGES = {"auto": "Auto", "en": "English", "he": "Hebrew"}
+# Download metadata is kept lightweight: checking models must not import PyTorch in the UI.
+MODEL_FILES = {
+    "small": ("small.pt", "9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794"),
+    "medium": ("medium.pt", "345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1"),
+    "large-v3": ("large-v3.pt", "e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb"),
+    "turbo": ("large-v3-turbo.pt", "aff26ae408abcba5fbf8813c21e62b0941638c5f6eebfb145be0c9839262a19a"),
+}
 
 
 class WhisperTranscriber:
@@ -39,53 +48,85 @@ class WhisperTranscriber:
         self._device = None
         settings = self._load_settings()
         self._model_name = self._preferred_model_name(settings)
+        if os.environ.get("LDI_MODEL") in MODEL_OPTIONS:
+            self._model_name = os.environ["LDI_MODEL"]
         self._translate_to_english = bool(settings.get("translate_to_english", False))
+        self._windows_cpu_fallback = settings.get("windows_device") == "cpu"
+        # Recordings detect their own language; obsolete UI preferences cannot pin it.
+        # An explicit CLI/environment override remains available for diagnostics.
+        self._language = os.environ.get("LDI_LANGUAGE", "auto")
+        if self._language not in LANGUAGES:
+            self._language = "auto"
         self._lock = threading.Lock()
+        self._worker = InferenceClient()
 
     def transcribe(self, audio_path: Path, progress_callback=None) -> str:
-        model_name = self._default_model_name()
-        device = self._default_device()
-        model = self._load_model(progress_callback=progress_callback)
-        return self._transcribe_single_pass(model, str(audio_path), model_name, device, progress_callback)
+        # ffmpeg also accepts compressed formats and resamples external recordings.
+        result = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(audio_path),
+                                 "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+                                capture_output=True, check=True)
+        with tempfile.TemporaryDirectory(prefix="local-voice-") as directory:
+            raw = Path(directory) / "audio.f32"
+            raw.write_bytes(result.stdout)
+            audio_frames = len(result.stdout) // 4
+            language = self.language()
+            text = ""
+            for start in range(0, audio_frames, 30 * 16000):
+                chunk = self.transcribe_chunk(raw, start, min(start + 30 * 16000, audio_frames),
+                                              language=language, progress_callback=progress_callback)
+                if chunk["text"]:
+                    language = language or chunk.get("language")
+                    text = (text + " " + chunk["text"]).strip()
+            return text
 
-    def _transcribe_single_pass(self, model, audio_input, model_name: str, device: str, progress_callback=None) -> str:
-        task = "translate" if self.translate_to_english_enabled_for_model(model_name) else "transcribe"
-        if progress_callback is not None:
-            verb = "Translating" if task == "translate" else "Transcribing"
-            progress_callback(f"{verb} on {model_name} ({device})...")
+    def language(self):
+        return None if self._language == "auto" else self._language
 
-        result = model.transcribe(
-            audio_input,
-            fp16=False,
-            verbose=False,
-            condition_on_previous_text=False,
-            task=task,
-        )
-        return result["text"].strip()
+    def save_language_preference(self, language):
+        if language not in LANGUAGES:
+            raise ValueError(f"Unsupported language: {language}")
+        self._language = language
+        self._write_settings({"language": language})
 
-    def _load_model(self, progress_callback=None):
+    def backend_name(self):
+        selected = os.environ.get("LDI_BACKEND")
+        if selected and selected not in {"mlx", "torch"}:
+            raise ValueError("LDI_BACKEND must be mlx or torch")
+        if selected:
+            return selected
+        if sys.platform == "darwin" and platform.machine() == "arm64" and os.environ.get("LDI_DEVICE", "mps") == "mps":
+            return "mlx"
+        return "torch"
+
+    def _worker_payload(self):
+        whisper = self._load_whisper_module()
+        self._ensure_model_downloaded(whisper, self._model_name)
+        return dict(model=self._model_name, backend=self.backend_name(), device=self._default_device(),
+                    checkpoint=str(self._model_target_path(whisper, self._model_name)),
+                    mlx_path=str(MODEL_DIR / "mlx" / self._model_name))
+
+    def transcribe_chunk(self, audio_path, start_frame, end_frame, *, language=None, task=None,
+                         cancel=None, progress_callback=None):
+        payload = self._worker_payload()
+        payload.update(op="transcribe", audio_path=str(audio_path), start_frame=start_frame, end_frame=end_frame,
+                       language=language, task=task or ("translate" if self.translate_to_english_enabled() else "transcribe"))
+        return self._worker.request(payload, cancel=cancel, progress_callback=progress_callback)
+
+    def _load_model(self, progress_callback=None, cancel=None):
         with self._lock:
             if self._model is None:
-                model_name = self._default_model_name()
-                whisper = self._load_whisper_module(progress_callback=progress_callback)
-                MODEL_DIR.mkdir(parents=True, exist_ok=True)
-                self._ensure_model_downloaded(whisper, model_name, progress_callback=progress_callback)
-                if progress_callback is not None:
-                    progress_callback(f"Loading {model_name} on {self._default_device()}...")
-                self._model = whisper.load_model(
-                    model_name,
-                    device=self._default_device(),
-                    download_root=str(MODEL_DIR),
-                )
+                payload = self._worker_payload()
+                payload["op"] = "load"
+                self._worker.request(payload, progress_callback=progress_callback, cancel=cancel)
+                self._model = self._worker
             return self._model
 
     def _load_whisper_module(self, progress_callback=None):
         if self._whisper is None:
-            if progress_callback is not None:
-                progress_callback("Importing Whisper runtime...")
-            import whisper
-
-            self._whisper = whisper
+            self._whisper = SimpleNamespace(_MODELS={
+                name: f"https://openaipublic.azureedge.net/main/whisper/models/{sha}/{filename}"
+                for name, (filename, sha) in MODEL_FILES.items()
+            })
         return self._whisper
 
     def _default_device(self) -> str:
@@ -95,6 +136,18 @@ class WhisperTranscriber:
         override = os.environ.get("LDI_DEVICE")
         if override:
             self._device = override
+            return self._device
+
+        if sys.platform == "win32" and self._windows_cpu_fallback:
+            self._device = "cpu"
+            return self._device
+
+        if sys.platform == "darwin" and platform.machine() == "x86_64":
+            self._device = "cpu"
+            return self._device
+
+        if sys.platform == "darwin" and platform.machine() == "arm64" and self.backend_name() == "mlx":
+            self._device = "mps"
             return self._device
 
         import torch
@@ -167,26 +220,23 @@ class WhisperTranscriber:
             self._release_model_locked()
 
     def _release_model_locked(self) -> None:
-        previous = self._model
         self._model = None
-        if previous is None:
-            return
-
-        del previous
-        gc.collect()
+        self._worker.close()
 
     def is_model_cached(self, model_name: str) -> bool:
         whisper = self._load_whisper_module()
         target = self._model_target_path(whisper, model_name)
         return target.is_file()
 
-    def download_model(self, model_name: str, progress_callback=None) -> Path:
+    def download_model(self, model_name: str, progress_callback=None, cancel=None) -> Path:
         if model_name not in MODEL_OPTIONS:
             raise ValueError(f"Unsupported model: {model_name}")
 
         whisper = self._load_whisper_module(progress_callback=progress_callback)
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        self._download_model_file(whisper, model_name, progress_callback=progress_callback)
+        from filelock import FileLock
+        with FileLock(str(self._model_target_path(whisper, model_name)) + ".download.lock"):
+            self._download_model_file(whisper, model_name, progress_callback=progress_callback, cancel=cancel)
         return self._model_target_path(whisper, model_name)
 
     def startup_message(self) -> str:
@@ -257,7 +307,7 @@ class WhisperTranscriber:
         }
         marker.write_text(json.dumps(payload))
 
-    def _download_model_file(self, whisper, model_name: str, progress_callback=None) -> None:
+    def _download_model_file(self, whisper, model_name: str, progress_callback=None, cancel=None) -> None:
         url = whisper._MODELS[model_name]
         expected_sha256 = url.split("/")[-2]
         target = self._model_target_path(whisper, model_name)
@@ -277,17 +327,15 @@ class WhisperTranscriber:
                 return
 
         partial = target.with_suffix(f"{target.suffix}.part")
-        partial.unlink(missing_ok=True)
-        target.unlink(missing_ok=True)
-        marker.unlink(missing_ok=True)
 
         if progress_callback is not None:
             progress_callback(f"Downloading {model_name}...")
 
         try:
-            self._download_url(url, partial)
+            if not partial.is_file() or self._sha256(partial) != expected_sha256:
+                from .downloads import download
+                download(url, partial, progress=progress_callback, cancel=cancel)
         except Exception as exc:
-            partial.unlink(missing_ok=True)
             raise RuntimeError(str(exc) or "Failed to download Whisper model.") from exc
 
         if progress_callback is not None:
@@ -303,71 +351,11 @@ class WhisperTranscriber:
 
     def _missing_model_message(self, model_name: str) -> str:
         return (
-            f"{model_name} is not cached. Run `./voice --download-model {model_name}` on macOS or "
-            f"`.\\voice_windows.bat --download-model {model_name}` on Windows first."
+            f"{model_name} is not cached. Run `./start.cmd --download-model {model_name}` first."
         )
 
-    def _download_url(self, url: str, target: Path) -> None:
-        errors: list[str] = []
-
-        curl_error = self._download_with_curl(url, target, allow_insecure=False)
-        if curl_error is None:
-            return
-        if curl_error:
-            errors.append(curl_error)
-
-        curl_insecure_error = self._download_with_curl(url, target, allow_insecure=True)
-        if curl_insecure_error is None:
-            return
-        if curl_insecure_error:
-            errors.append(curl_insecure_error)
-
-        try:
-            self._download_with_python(url, target, allow_insecure=False)
-            return
-        except Exception as exc:
-            errors.append(str(exc))
-
-        try:
-            self._download_with_python(url, target, allow_insecure=True)
-            return
-        except Exception as exc:
-            errors.append(str(exc))
-
-        joined = "; ".join(error for error in errors if error)
-        raise RuntimeError(joined or "Failed to download Whisper model.")
-
-    def _download_with_curl(self, url: str, target: Path, allow_insecure: bool) -> str | None:
-        curl = shutil.which("curl")
-        if curl is None:
-            return "curl is not installed"
-
-        command = [curl, "-L", "--fail"]
-        if allow_insecure:
-            command.append("-k")
-        command.extend(["-o", str(target), url])
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode == 0:
-            return None
-        return result.stderr.strip() or result.stdout.strip() or "curl download failed"
-
-    def _download_with_python(self, url: str, target: Path, allow_insecure: bool) -> None:
-        context = ssl._create_unverified_context() if allow_insecure else None
-        try:
-            with urlopen(url, context=context) as response, target.open("wb") as handle:
-                shutil.copyfileobj(response, handle)
-        except (HTTPError, URLError, OSError) as exc:
-            raise RuntimeError(str(exc)) from exc
-
     def _load_settings(self) -> dict:
-        try:
-            payload = json.loads(SETTINGS_PATH.read_text())
-        except Exception:
-            return {}
-
-        if isinstance(payload, dict):
-            return payload
-        return {}
+        return read_settings(SETTINGS_PATH)
 
     def _preferred_model_name(self, settings: dict) -> str:
         model_name = settings.get("model")
@@ -376,8 +364,7 @@ class WhisperTranscriber:
         return DEFAULT_MODEL
 
     def _write_settings(self, payload: dict) -> None:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_PATH.write_text(json.dumps(payload))
+        write_settings(payload, SETTINGS_PATH)
 
     def _timestamp_now(self) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -425,8 +412,8 @@ class WhisperTranscriber:
         if max_overlap <= 0:
             return 0
 
-        normalized_existing = [self._normalize_overlap_word(word) for word in existing_words]
-        normalized_incoming = [self._normalize_overlap_word(word) for word in incoming_words]
+        normalized_existing = [self._normalize_overlap_word(word) for word in existing_words[-OVERLAP_WORD_LIMIT:]]
+        normalized_incoming = [self._normalize_overlap_word(word) for word in incoming_words[:OVERLAP_WORD_LIMIT]]
 
         for overlap_count in range(max_overlap, 0, -1):
             if normalized_existing[-overlap_count:] == normalized_incoming[:overlap_count]:

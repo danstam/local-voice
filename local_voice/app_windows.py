@@ -6,15 +6,18 @@ import queue
 import threading
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from typing import Callable
 
 from .recorder import Recorder
+from .hotkeys import WINDOWS_SHORTCUT, global_hotkey, windows_shortcut
+from .settings import read_settings, write_settings
 from .sessions import ChunkedRecordingSession
+from .workspace import cleanup_stale_workspaces
 from .transcriber import MODEL_OPTIONS, MODEL_TITLES, WhisperTranscriber
 
 BASE_WINDOW_WIDTH = 360
-BASE_WINDOW_HEIGHT = 260
+BASE_WINDOW_HEIGHT = 300
 UI_SCALE = 0.78
 WINDOW_MARGIN = 24
 POLL_INTERVAL_MS = 100
@@ -76,6 +79,8 @@ STATUS_DOT_SIZE = max(8, S(10))
 class UiEvent:
     kind: str
     payload: str = ""
+    generation: int = 0
+    partial_text: str = ""
 
 
 @dataclass
@@ -102,7 +107,9 @@ class DictationApp:
         except tk.TclError:
             pass
 
-        self.recorder = Recorder()
+        cleanup_stale_workspaces()
+        self.preferences = read_settings()
+        self.recorder = Recorder(device=self.preferences.get("windows_input_device"))
         self.transcriber = WhisperTranscriber()
         self.ui_queue: queue.Queue[UiEvent] = queue.Queue()
         self.recording_session: ChunkedRecordingSession | None = None
@@ -112,12 +119,19 @@ class DictationApp:
         self.switching_model = False
         self.loading = False
         self.model_ready = False
+        self.session_generation = 0
+        self.cancelling = False
+        self.recording_hotkey = None
         self.wave_history: list[float] = []
         self.wave_items: list[int] = []
         self.status_text = tk.StringVar(value="Loading")
         self.model_var = tk.StringVar()
         self.english_button: FlatButton | None = None
         self._build_window()
+        self.settings_menu = tk.Menu(self.root)
+        self.settings_menu.add_command(label="Settings…", command=self.open_settings)
+        self.settings_menu.add_command(label="Download/change model…", command=self.open_model_setup)
+        self.root.configure(menu=self.settings_menu)
 
         self._set_status("Loading", ORANGE)
         self._set_transcript(IDLE_TEXT)
@@ -127,6 +141,75 @@ class DictationApp:
         self.root.protocol("WM_DELETE_WINDOW", self.quit_clicked)
         self.root.after(POLL_INTERVAL_MS, self._drain_queue)
         self.root.after(VISUALIZER_INTERVAL_MS, self._refresh_visualizer)
+        self._start_model_warmup()
+
+    def open_settings(self):
+        if self.recording or self.paused or self.transcribing:
+            messagebox.showinfo("Settings", "Finish the current recording first.", parent=self.root)
+            return
+        from .audio_devices import input_devices
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Local Voice settings")
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        enabled = tk.BooleanVar(value=self.preferences.get("windows_hotkey_enabled", False))
+        ttk.Checkbutton(body, text="Enable a global recording shortcut", variable=enabled).pack(anchor="w")
+        key = tk.StringVar(value=self.preferences.get("windows_hotkey", WINDOWS_SHORTCUT))
+        ttk.Entry(body, textvariable=key, width=40).pack(fill="x", pady=8)
+        ttk.Label(body, text="Example: Ctrl+Alt+Space. Other apps may use your chosen shortcut.").pack(anchor="w")
+        ttk.Label(body, text="Microphone").pack(anchor="w", pady=(14, 4))
+        try:
+            devices = input_devices()
+        except Exception as exc:
+            devices = []
+            messagebox.showwarning("Microphones unavailable", str(exc), parent=dialog)
+        selection = ttk.Combobox(body, state="readonly", width=55,
+                                 values=["System default"] + [d["label"] for d in devices])
+        selection.current(0)
+        for index, device in enumerate(devices, 1):
+            if {k: device[k] for k in ("name", "hostapi")} == self.preferences.get("windows_input_device"):
+                selection.current(index)
+        selection.pack(fill="x")
+
+        def apply():
+            try:
+                if enabled.get():
+                    windows_shortcut(key.get())
+                if self.recording_hotkey is not None:
+                    self.recording_hotkey.close()
+                    self.recording_hotkey = None
+                device = None if selection.current() <= 0 else {k: devices[selection.current() - 1][k] for k in ("name", "hostapi")}
+                updates = {"windows_hotkey_enabled": enabled.get(), "windows_hotkey": key.get().strip(),
+                           "windows_input_device": device}
+                write_settings(updates)
+                self.preferences.update(updates)
+                self.recorder.device = device
+                self._sync_recording_hotkey()
+            except Exception as exc:
+                messagebox.showerror("Could not apply settings", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+
+        ttk.Button(body, text="Save", command=apply).pack(anchor="e", pady=(16, 0))
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+    def open_model_setup(self):
+        if self.recording or self.paused or self.transcribing or self.loading or self.switching_model:
+            messagebox.showinfo("Models", "Finish the current operation first.", parent=self.root)
+            return
+        from .windows_first_run import model_setup
+        self.model_ready = False
+        self._refresh_buttons()
+        self.transcriber.unload_model()
+        model_setup(self.root, on_ready=self._model_setup_ready, on_cancel=self._start_model_warmup)
+
+    def _model_setup_ready(self, model):
+        settings = read_settings()
+        self.transcriber._windows_cpu_fallback = settings.get("windows_device") == "cpu"
+        self.transcriber._device = None
+        self.transcriber.set_model_name(model)
         self._start_model_warmup()
 
     def _build_window(self) -> None:
@@ -142,6 +225,7 @@ class DictationApp:
             pady=OUTER_PAD_Y,
         )
         outer.pack(fill="both", expand=True)
+        self.expanded_view = outer
 
         header = tk.Frame(outer, bg=CARD_BG)
         header.pack(fill="x")
@@ -176,6 +260,8 @@ class DictationApp:
             bg=CARD_BG,
             fg=TEXT_SECONDARY,
             font=("TkDefaultFont", UI_FONT, "bold"),
+            width=10,
+            anchor="w",
         )
         status_label.pack(side="left", padx=(6, 10))
 
@@ -252,6 +338,11 @@ class DictationApp:
         self.quit_button.pack(side="left", padx=(HEADER_GAP, 0))
 
         content = tk.Frame(outer, bg=CARD_BG)
+        self.progress_text = tk.StringVar(value="")
+        progress_row = tk.Frame(outer, bg=CARD_BG)
+        progress_row.pack(fill="x")
+        tk.Label(progress_row, textvariable=self.progress_text, bg=CARD_BG, fg=TEXT_SECONDARY,
+                 anchor="w", font=("TkDefaultFont", 8)).pack(side="left", fill="x", expand=True)
         content.pack(fill="both", expand=True, pady=(CONTENT_PAD_Y, CONTENT_PAD_Y))
 
         self.transcript_container = tk.Frame(
@@ -266,6 +357,7 @@ class DictationApp:
         self.transcript_view = tk.Text(
             transcript_inner,
             wrap="word",
+            width=1,
             height=TEXT_LINES,
             bg=TEXT_BG,
             fg=TEXT_PRIMARY,
@@ -355,6 +447,12 @@ class DictationApp:
         self.copy_button = self._make_button(buttons, "Copy", self.copy_clicked, "secondary")
         self.copy_button.pack(side="left", fill="x", expand=True)
 
+    def _widget_dimensions(self) -> tuple[int, int]:
+        # Native fonts and Windows display scaling can exceed our design pixels.
+        # Measure real controls so Quit, EN, and the model selector stay visible.
+        self.root.update_idletasks()
+        return max(WINDOW_WIDTH, self.expanded_view.winfo_reqwidth()), max(WINDOW_HEIGHT, self.expanded_view.winfo_reqheight())
+
     def _build_waveform(self) -> None:
         self.wave_items = []
         self.wave_history = [0.0] * 19
@@ -428,9 +526,10 @@ class DictationApp:
         self.root.update_idletasks()
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = screen_width - WINDOW_WIDTH - WINDOW_MARGIN
-        y = max(WINDOW_MARGIN, (screen_height // 2) - (WINDOW_HEIGHT // 2))
-        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
+        width, height = self._widget_dimensions()
+        x = max(0, screen_width - width - WINDOW_MARGIN)
+        y = max(0, min(max(WINDOW_MARGIN, (screen_height - height) // 2), screen_height - height))
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def record_clicked(self) -> None:
         if self.transcribing or self.switching_model:
@@ -475,12 +574,25 @@ class DictationApp:
             self._set_transcript(str(exc))
             return
 
-        self.recording_session = ChunkedRecordingSession(self.recorder, self.transcriber)
+        self.session_generation += 1
+        generation = self.session_generation
+        try:
+            self.recording_session = ChunkedRecordingSession(
+                self.recorder, self.transcriber,
+                progress_callback=lambda message: self.ui_queue.put(UiEvent("progress", message, generation)),
+                error_callback=lambda message: self.ui_queue.put(UiEvent("recording_failed", message, generation)))
+            self.recording_session.ui_generation = generation
+        except Exception as exc:
+            self.recorder.stop()
+            self._set_status("Save error", PINK)
+            self._set_transcript(str(exc))
+            return
         self.recording = True
         self.paused = False
         self._set_status("Recording", RED)
         self._set_loading(False)
         self._set_transcript("")
+        self.progress_text.set("")
         self._refresh_buttons()
 
     def stop_clicked(self) -> None:
@@ -491,7 +603,6 @@ class DictationApp:
         self.recording = False
         self.paused = False
         self.transcribing = True
-        self.recording_session = None
         self._set_status("Working", ORANGE)
         self._set_loading(True, "Transcribing...")
         self._refresh_buttons()
@@ -502,35 +613,88 @@ class DictationApp:
         text = self._current_text()
         if not text:
             return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
+        self._copy_to_clipboard(text)
+
+    def _copy_to_clipboard(self, text) -> bool:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError as exc:
+            self._set_status("Copy failed", ORANGE)
+            print(f"[Local Voice] Clipboard copy failed: {exc}")
+            return False
         self._set_status("Copied", GREEN)
+        return True
+
+    def _start_recording_hotkey(self):
+        if not getattr(self, "preferences", {}).get("windows_hotkey_enabled", False):
+            return
+        try:
+            shortcut = self.preferences.get("windows_hotkey", WINDOWS_SHORTCUT)
+            self.recording_hotkey = global_hotkey(lambda: self.ui_queue.put(UiEvent("shortcut")), shortcut)
+            self.recording_hotkey.start()
+            print(f"[Local Voice] Global shortcut ready: {shortcut}")
+        except Exception as exc:
+            self.progress_text.set("Shortcut unavailable · use Rec / Stop")
+            print(f"[Local Voice] Global shortcut unavailable: {exc}")
+
+    def _sync_recording_hotkey(self):
+        usable = self.model_ready and not self.loading and not self.switching_model and not self.transcribing
+        if getattr(self, "recording_hotkey", None) is not None:
+            if usable and getattr(self, "preferences", {}).get("windows_hotkey_enabled", False):
+                return
+            try:
+                self.recording_hotkey.close()
+            except RuntimeError as exc:
+                self.progress_text.set(str(exc))
+                return
+            self.recording_hotkey = None
+        if usable:
+            self._start_recording_hotkey()
+
+    def _recording_shortcut(self):
+        if not self.model_ready or self.loading or self.transcribing or self.switching_model or self.cancelling:
+            return
+        if self.recording or self.paused:
+            self.stop_clicked()
+        else:
+            self.record_clicked()
 
     def cancel_clicked(self) -> None:
-        if (not self.recording and not self.paused) or self.recording_session is None:
+        if self.recording_session is None or self.cancelling:
             return
 
         session = self.recording_session
-        self.recording_session = None
+        self.session_generation += 1
+        generation = self.session_generation
         self.recording = False
         self.paused = False
-        try:
-            self.recorder.stop()
-        except Exception:
-            pass
-        self.recorder.clear()
-        session.stop_requested.set()
-        self._set_status("Ready", GREEN)
-        self._ensure_idle_text()
+        self.transcribing = True
+        self.cancelling = True
+        self._set_status("Cancelling", ORANGE)
         self._refresh_buttons()
 
-    def quit_clicked(self) -> None:
-        if self.recording or self.paused:
+        def cancel():
             try:
-                self.recorder.stop()
-            except Exception:
-                pass
-            self.recorder.clear()
+                session.cancel()
+                self.ui_queue.put(UiEvent("cancelled", generation=generation))
+            except Exception as exc:
+                self.ui_queue.put(UiEvent("error", str(exc), generation))
+
+        threading.Thread(target=cancel, daemon=True).start()
+
+    def quit_clicked(self) -> None:
+        if self.recording_hotkey is not None:
+            try:
+                self.recording_hotkey.close()
+            except RuntimeError as exc:
+                print(f"[Local Voice] {exc}")
+            self.recording_hotkey = None
+        if self.recording_session is not None:
+            self.recording_session.cancel()
+        # Abort warmup before waiting on the transcriber's model lock.
+        self.transcriber._worker.close(graceful=False)
+        self.transcriber.unload_model()
         self.root.destroy()
 
     def english_toggle_clicked(self) -> None:
@@ -558,12 +722,20 @@ class DictationApp:
             except queue.Empty:
                 break
 
-            if event.kind == "transcript":
+            if event.generation and event.generation != self.session_generation:
+                continue
+
+            if event.kind == "shortcut":
+                self._recording_shortcut()
+            elif event.kind == "transcript":
+                self.recording_session = None
                 self.transcribing = False
                 self._set_loading(False)
                 self._set_transcript(event.payload or "No speech recognized.")
                 self._set_status("Ready", GREEN)
                 self._refresh_buttons()
+                if event.payload:
+                    self._copy_to_clipboard(event.payload)
             elif event.kind == "ready":
                 self.switching_model = False
                 self.model_ready = True
@@ -579,22 +751,40 @@ class DictationApp:
                 self._set_status("Ready", GREEN)
                 self._refresh_buttons()
             elif event.kind == "error":
+                self.recording_session = None
+                self.cancelling = False
                 self.switching_model = False
                 self.recording = False
                 self.paused = False
                 self.transcribing = False
                 self._set_loading(False)
-                self._set_transcript(event.payload)
+                self._set_transcript(event.partial_text or event.payload)
+                if event.partial_text:
+                    self.progress_text.set("Interrupted · showing completed text")
                 self._set_status("Failed", PINK)
                 self._refresh_buttons()
             elif event.kind == "no_audio":
+                self.recording_session = None
                 self.transcribing = False
                 self._set_loading(False)
                 self._set_transcript(event.payload)
                 self._set_status("No audio", ORANGE)
                 self._refresh_buttons()
             elif event.kind == "progress":
-                self._set_loading(True)
+                self.progress_text.set(event.payload)
+                print(f"[Local Voice] {event.payload}")
+            elif event.kind == "cancelled":
+                self.recording_session = None
+                self.cancelling = False
+                self.transcribing = False
+                self._set_loading(False)
+                self._set_status("Ready", GREEN)
+                self._set_transcript(IDLE_TEXT)
+                self.progress_text.set("")
+                self._refresh_buttons()
+            elif event.kind == "recording_failed":
+                self.progress_text.set(event.payload)
+                self.stop_clicked()
 
         self._schedule(POLL_INTERVAL_MS, self._drain_queue)
 
@@ -613,16 +803,14 @@ class DictationApp:
     def _finalize_recording_session(self, session: ChunkedRecordingSession) -> None:
         try:
             text = session.stop_recording_and_wait(
-                progress_callback=lambda message: self.ui_queue.put(UiEvent("progress", message))
+                progress_callback=lambda message: self.ui_queue.put(UiEvent("progress", message, session.ui_generation))
             )
             if text is None:
-                self.ui_queue.put(UiEvent("no_audio", "No audio was captured. Try again."))
+                self.ui_queue.put(UiEvent("no_audio", "No audio was captured. Try again.", session.ui_generation))
                 return
-            if not text:
-                text = "No speech recognized."
-            self.ui_queue.put(UiEvent("transcript", text))
+            self.ui_queue.put(UiEvent("transcript", text, session.ui_generation))
         except Exception as exc:
-            self.ui_queue.put(UiEvent("error", str(exc)))
+            self.ui_queue.put(UiEvent("error", str(exc), session.ui_generation, getattr(exc, "partial_text", "")))
 
     def _warm_model_in_background(self) -> None:
         try:
@@ -644,7 +832,7 @@ class DictationApp:
         if not self.transcriber.is_model_cached(model_name):
             self._set_status("Download first", ORANGE)
             self._set_transcript(
-                f"{model_name} is not cached yet.\n\nRun:\n.\\voice_windows.bat --download-model {model_name}"
+                f"{model_name} is not cached yet.\n\nRun:\n./start.cmd --download-model {model_name}"
             )
             self._refresh_buttons()
             return
@@ -711,15 +899,16 @@ class DictationApp:
         self._reset_waveform()
 
     def _refresh_buttons(self) -> None:
+        self._sync_recording_hotkey()
         busy = self.transcribing or self.switching_model
         can_copy = bool(self._current_text()) and not self.recording and not self.paused and not busy
         record_title = "Resume" if self.paused else ("Pause" if self.recording else "Rec")
         record_role = "record" if self.paused or not self.recording else "secondary"
         self._style_button(self.record_button, record_title, record_role, self.model_ready and not busy)
         self._style_button(self.stop_button, "Stop", "stop", self.recording or self.paused)
-        if self.recording or self.paused:
+        if self.recording or self.paused or (self.transcribing and self.recording_session is not None):
             self.copy_button.command = self.cancel_clicked
-            self._style_button(self.copy_button, "Cancel", "secondary", True)
+            self._style_button(self.copy_button, "Cancel", "secondary", not self.cancelling)
         else:
             self.copy_button.command = self.copy_clicked
             self._style_button(self.copy_button, "Copy", "secondary", can_copy)
@@ -751,7 +940,11 @@ class DictationApp:
 
     def _translation_toggle_enabled(self) -> bool:
         return (
-            not self.recording
+            self.model_ready
+            and not self.loading
+            and not self.switching_model
+            and not self.cancelling
+            and not self.recording
             and not self.paused
             and not self.transcribing
             and self.transcriber.current_model_supports_translation()
@@ -882,14 +1075,12 @@ class DictationApp:
 
 
 def main() -> None:
+    from . import cli
     parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--download-model", choices=MODEL_OPTIONS)
+    cli.arguments(parser)
     args = parser.parse_args()
 
-    if args.download_model:
-        transcriber = WhisperTranscriber()
-        path = transcriber.download_model(args.download_model, progress_callback=print)
-        print(f"Ready: {path}")
+    if cli.handle(args):
         return
 
     root = tk.Tk()

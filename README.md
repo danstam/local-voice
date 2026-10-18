@@ -6,9 +6,7 @@ A floating desktop widget that records your speech and transcribes it locally. N
 
 ## What is this?
 
-Local Voice is a local speech-to-text tool that runs entirely on your machine. It was built to speed up the process of writing long, detailed prompts for AI agents — dictating an architecture decision or a complex instruction is significantly faster than typing it. The result lands in the widget's text area, ready to copy anywhere. No account, no API key, and no audio ever leaves your machine.
-
-The widget runs as a floating panel that stays on top of other windows. On macOS it uses native Cocoa. On Windows it uses tkinter. Both implementations share the same recording and transcription backend.
+Local Voice is a local speech-to-text tool for macOS and Windows. It was built to make writing long prompts, notes, and detailed instructions faster through dictation. No account, no API key, and no cloud processing.
 
 ## Table of Contents
 
@@ -16,86 +14,81 @@ The widget runs as a floating panel that stays on top of other windows. On macOS
 - [Setup](#setup)
 - [Run](#run)
 - [Models](#models)
-- [Architecture](#architecture)
+- [Privacy](#privacy)
 
 ---
 
 ## Prerequisites
 
-- Git
-- macOS only: [Homebrew](https://brew.sh) — the installer uses it to set up Python and ffmpeg automatically
+- macOS 14 or newer, or Windows 10/11 x64 on an Intel or AMD processor.
+- Git to clone the repository.
+- Internet access for the initial downloads, a working microphone, and several GB of free disk space. Larger models need more memory and storage.
+
+You do not need to install Python, Homebrew, or manage a virtual environment. Setup handles the application's Python and dependencies separately from any existing Python installation.
+
+Setup checks compatibility automatically and explains what to do if your computer cannot run the app.
 
 ---
 
 ## Setup
 
-Clone the repository and run the installer. The installer will set up the environment, install dependencies, and walk you through downloading a model.
+Use the same commands in **macOS Terminal** or **Windows PowerShell**:
 
-**macOS**
-
-```bash
+```sh
 git clone https://github.com/danstam/local-voice.git
 cd local-voice
-./install.sh
+./setup.cmd
 ```
 
-**Windows**
+Setup detects your computer, prepares everything it needs, and checks that speech recognition works locally. It shows progress in the terminal and saves technical details in a log. The first installation can take a while because the downloads are large.
 
-```bat
-git clone https://github.com/danstam/local-voice.git
-cd local-voice
-install.bat
+Setup chooses a speech model automatically, so you do not need to understand the model options to install the app. An existing Mac model preference is preserved.
+
+If you want to choose a model yourself, this optional command installs Medium:
+
+```sh
+./setup.cmd --model medium
 ```
 
-The installer will prompt you to select a model before finishing. See [Models](#models) for guidance on which one to pick. Dependencies include PyTorch (~2 GB) and will be downloaded once during this step.
+See [Models](#models) for the available choices. If Windows GPU setup fails, you can retry with `./setup.cmd --cpu`.
+
+For an existing checkout, close the app, update the source, and rerun `./setup.cmd`. Your downloaded models and preferences are reused. If setup is interrupted, run it again to retry.
+
+To check an existing installation without downloading or installing anything:
+
+```sh
+./setup.cmd --check
+```
 
 ---
 
 ## Run
 
-**macOS**
+After setup, use the same command on Mac or Windows:
 
-```bash
-./voice
+```sh
+./start.cmd
 ```
 
-**Windows**
-
-```bat
-voice_windows.bat
-```
-
-The widget appears on the right side of the screen. On first launch it loads the model in the background — the status indicator shows **Loading** until it is ready. Subsequent launches are faster once the model is warm in memory.
+The widget loads the selected model in the background and shows **Ready** when it is available. Mac starts in compact mode; Windows opens the full interface with recording controls visible and hotkeys off by default.
 
 ---
 
 ## Models
 
-| Model | Size | Speed | Notes |
-|---|---|---|---|
-| `small` | ~461 MB | Fast | Good for clear English. Can be imprecise. |
-| `turbo` | ~1.6 GB | Fast | Best quality-to-speed ratio for English. |
-| `medium` | ~1.4 GB | Moderate | Best balance for non-English speakers. Supports the EN toggle. |
-| `large-v3` | ~3.1 GB | Slow | Highest accuracy across all languages. Supports the EN toggle. Heavy for most hardware. |
+| Model | Approximate download | Notes |
+| --- | --- | --- |
+| `small` | 0.5 GB | Lightest option for computers with limited resources. |
+| `turbo` | 1.6 GB | Everyday multilingual dictation, including English and Hebrew. |
+| `medium` | 1.5 GB | Multilingual dictation and translation into English. |
+| `large-v3` | 3.1 GB | Largest model; supports translation into English and needs more resources. |
 
-The **EN** button transcribes directly into English regardless of what language you speak — no separate translation step. It is only available when `medium` or `large-v3` is active.
+The **EN** option produces English output from speech in another language. It is available with Medium and Large and runs entirely locally.
 
-The model can be switched at any time from the dropdown in the widget header. Switching loads the new model in the background without restarting the app. Only models that have been downloaded are available for selection.
+Download additional models with `./start.cmd --download-model medium`, then select the downloaded model in the widget. Replace `medium` with any model name from the table. Larger models require more memory than their download size and can be slower, especially on CPU.
 
 ---
 
-## Architecture
+## Privacy
 
-**Chunked transcription**
-
-Recording and transcription happen concurrently. While you are speaking, the engine continuously sends audio chunks for processing in the background — it does not wait for you to stop. By the time you press Stop, most of the audio has already been processed. Only the final chunk remains.
-
-This means transcription latency is roughly constant regardless of recording length. A 20-minute session and a 10-second session feel the same at the end. Chunk boundaries are handled by a word-overlap merge that detects and removes duplicate words at the seam between consecutive chunks, so the output reads as a single continuous transcript.
-
-**Hardware acceleration**
-
-The engine detects the best available device automatically — Apple Silicon (MPS), NVIDIA GPU (CUDA), or CPU — and loads the model accordingly. No configuration needed.
-
-### Privacy
-
-All processing happens on your machine. There are no API calls, no telemetry, and no network requests during normal use. The only outbound connection is the one-time model download.
+All speech processing happens on your computer. There are no cloud inference calls or telemetry. Internet access is used for setup and additional downloads; dictation works offline once the model is available. Audio is processed temporarily and is not retained as recording history. Text is saved locally only when you explicitly choose to pin it.

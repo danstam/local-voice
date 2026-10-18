@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import threading
+import sys
 
 import numpy as np
 import sounddevice as sd
@@ -11,7 +12,9 @@ CHANNELS = 1
 
 
 class Recorder:
-    def __init__(self) -> None:
+    def __init__(self, device=None) -> None:
+        self.device = device
+        self._resampler = None
         self._stream: sd.InputStream | None = None
         self._chunks: deque[np.ndarray] = deque()
         self._lock = threading.Lock()
@@ -21,6 +24,20 @@ class Recorder:
         self._level = 0.0
 
     def start(self) -> None:
+        device = self.device
+        rate = SAMPLE_RATE
+        resampler = None
+        if sys.platform == "win32" or device is not None:
+            from .audio_devices import resolve_input_device
+            device = resolve_input_device(device)
+            try:
+                sd.check_input_settings(device=device, samplerate=rate, channels=CHANNELS, dtype="float32")
+            except sd.PortAudioError:
+                info = sd.query_devices(device, "input")
+                rate = float(info["default_samplerate"])
+                sd.check_input_settings(device=device, samplerate=rate, channels=CHANNELS, dtype="float32")
+                import soxr
+                resampler = soxr.ResampleStream(rate, SAMPLE_RATE, CHANNELS, dtype="float32", quality="HQ")
         with self._lock:
             if self._stream is not None:
                 raise RuntimeError("Already recording")
@@ -32,8 +49,10 @@ class Recorder:
 
             def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
                 if status:
-                    print(f"recording status: {status}")
-                chunk = indata.copy()
+                    print(f"[Local Voice] Audio stream warning: {status}")
+                chunk = indata.copy() if resampler is None else resampler.resample_chunk(indata)
+                if not len(chunk):
+                    return
                 level = self._normalize_level(chunk)
                 with self._lock:
                     self._chunks.append(chunk)
@@ -44,13 +63,15 @@ class Recorder:
                         self._level = (self._level * 0.86) + (level * 0.14)
 
             stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
+                samplerate=rate,
                 channels=CHANNELS,
                 dtype="float32",
                 callback=callback,
+                **({"device": device} if device is not None else {}),
             )
             self._stream = stream
             self._paused = False
+            self._resampler = resampler
 
         try:
             stream.start()
@@ -107,6 +128,13 @@ class Recorder:
                 stream.stop()
         finally:
             stream.close()
+            if self._resampler is not None:
+                tail = self._resampler.resample_chunk(np.zeros((0, CHANNELS), dtype=np.float32), last=True)
+                with self._lock:
+                    if len(tail):
+                        self._chunks.append(tail.copy())
+                        self._total_frames += len(tail)
+                self._resampler = None
 
     def total_frames(self) -> int:
         with self._lock:
