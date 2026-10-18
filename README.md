@@ -40,7 +40,7 @@ cd local-voice
 ./setup.cmd
 ```
 
-Setup detects your computer, prepares everything it needs, and checks that speech recognition works locally. It shows progress in the terminal and saves technical details in a log. The first installation can take a while because the downloads are large.
+Setup detects your computer, prepares everything it needs, and checks that speech recognition works locally. It also adds a `voice` command for your user account, preserving existing commands and PATH entries. It shows progress in the terminal and saves technical details in a log. The first installation can take a while because the downloads are large.
 
 Setup chooses a speech model automatically, so you do not need to understand the model options to install the app. An existing Mac model preference is preserved.
 
@@ -64,13 +64,17 @@ To check an existing installation without downloading or installing anything:
 
 ## Run
 
-After setup, use the same command on Mac or Windows:
+After setup, close and reopen your terminal. On Mac or Windows, launch Local Voice from any folder with:
 
 ```sh
-./start.cmd
+voice
 ```
 
 The widget loads the selected model in the background and shows **Ready** when it is available. Mac starts in compact mode; Windows opens the full interface with recording controls visible and hotkeys off by default.
+
+If a different `voice` command already exists, setup keeps it and explains how to launch this copy with `./start.cmd` from the project folder. Keep the project folder in place; if you move it, rerun setup from its new location.
+
+To remove just the terminal shortcut, run `./setup.cmd --remove-command` from the project folder. The app, models, and preferences are kept.
 
 ---
 

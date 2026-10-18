@@ -88,20 +88,23 @@ def setup(args):
     setup_ui.say("Testing the speech engine...")
     run(command(python, "--mac-setup", "--verify-model", model,
                 *(["--check"] if args.check else []), *(["--cpu"] if args.cpu else [])))
-    setup_ui.say("Checks passed." if args.check else "Setup complete.")
-    setup_ui.say("Run ./start.cmd to open Local Voice.")
+    from .command_install import finish_setup
+    finish_setup(PROJECT, check=args.check)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare Local Voice automatically for this Mac.")
     parser.add_argument("--bootstrap", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--check", action="store_true", help="Check an existing installation offline")
+    parser.add_argument("--remove-command", action="store_true", help="Remove the voice shortcut without removing Local Voice")
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--prepare-only", action="store_true", help="Prepare the app without downloading a speech model")
     parser.add_argument("--verify-model", help=argparse.SUPPRESS)
     parser.add_argument("--model", choices=["small", "turbo", "medium", "large-v3"], help="Advanced: choose a specific speech model")
     parser.add_argument("--cpu", action="store_true", help="Test speech recognition using the processor")
     args = parser.parse_args()
+    if args.check and args.remove_command:
+        parser.error("Choose either --check or --remove-command; checks do not change shortcuts.")
     if sys.platform != "darwin":
         raise RuntimeError("This runtime setup is for macOS.")
     if args.probe:
@@ -129,7 +132,11 @@ def main():
     with setup_ui.SetupConsole(target) as console:
         logging.info("Starting macOS %s", "checks" if args.check else "setup")
         try:
-            setup(args)
+            if args.remove_command:
+                from .command_install import remove_with_output
+                remove_with_output(PROJECT)
+            else:
+                setup(args)
         except (Exception, KeyboardInterrupt) as exc:
             console.failed(exc)
             raise SystemExit(1)

@@ -6,7 +6,7 @@ case "$(uname -s)" in
     *) echo 'Local Voice currently supports macOS and Windows.' >&2; exit 1 ;;
 esac
 if [ "${1:-}" = '--help' ]; then
-    echo 'Automatic Local Voice setup: --check, --model small|turbo|medium|large-v3, --cpu, --prepare-only'
+    echo 'Automatic Local Voice setup: --check, --model small|turbo|medium|large-v3, --cpu, --prepare-only, --remove-command'
     exit 0
 fi
 major=$(sw_vers -productVersion | cut -d. -f1)
@@ -21,7 +21,7 @@ fi
 log="$base/bootstrap.log"
 fail() { echo "$1" >&2; echo "Details saved to: $log" >&2; exit 1; }
 for option in "$@"; do
-    if [ "$option" = '--check' ]; then
+    if [ "$option" = '--check' ] || [ "$option" = '--remove-command' ]; then
         exec /bin/sh "$project/scripts/start-posix.sh" --mac-setup "$@"
     fi
 done

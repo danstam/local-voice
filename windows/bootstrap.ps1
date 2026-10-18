@@ -1,4 +1,4 @@
-# No Python discovery, system installation, registry changes, or persistent PATH edits.
+# The bootstrap leaves system Python alone; successful setup adds a user-only voice command.
 $ErrorActionPreference = 'Stop'
 $Project = Split-Path $PSScriptRoot -Parent
 $Options = @($args)
@@ -18,7 +18,7 @@ function Invoke-Quiet {
 }
 try {
     if ($Options -contains '--help') {
-        Write-Host 'Local Voice setup: --cpu, --model small|turbo|medium|large-v3, --check, --prepare-only'
+        Write-Host 'Local Voice setup: --cpu, --model small|turbo|medium|large-v3, --check, --prepare-only, --remove-command'
         exit 0
     }
     $Architecture = $env:PROCESSOR_ARCHITECTURE
@@ -30,7 +30,7 @@ try {
     New-Item -ItemType Directory -Force $Private | Out-Null
     # The OS releases this lock even if the installer is killed or crashes.
     $Lock = [IO.File]::Open((Join-Path $Private 'setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
-    if ($Options -contains '--check') {
+    if (($Options -contains '--check') -or ($Options -contains '--remove-command')) {
         & (Join-Path $PSScriptRoot 'launch.ps1') --setup @Options
         exit $LASTEXITCODE
     }

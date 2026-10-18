@@ -365,8 +365,8 @@ def setup(args):
     setup_ui.say("Checking the microphone...")
     run(command(python, "--setup", "--microphone"), timeout=60)
     log.info("%s verified. Run ./start.cmd to launch.", "Diagnostics" if args.check else "Setup")
-    setup_ui.say("Checks passed." if args.check else "Setup complete.")
-    setup_ui.say("Run ./start.cmd to open Local Voice.")
+    from .command_install import finish_setup
+    finish_setup(PROJECT, check=args.check)
 
 
 def main():
@@ -374,6 +374,7 @@ def main():
     parser.add_argument("--bootstrap", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--prepare-only", action="store_true", help="Prepare the private runtime without downloading a model")
     parser.add_argument("--check", action="store_true", help="Offline diagnostics; no installs or downloads")
+    parser.add_argument("--remove-command", action="store_true", help="Remove the voice shortcut without removing Local Voice")
     parser.add_argument("--cpu", action="store_true", help="Use CPU even if an NVIDIA GPU is present")
     parser.add_argument("--model", choices=list(MODELS))
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
@@ -383,6 +384,8 @@ def main():
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help=argparse.SUPPRESS)
     parser.add_argument("--save", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.check and args.remove_command:
+        parser.error("Choose either --check or --remove-command; checks do not change shortcuts.")
     if sys.platform != "win32":
         parser.exit(1, "Run ./setup.cmd to choose the right setup for this computer.\n")
     if args.probe:
@@ -406,7 +409,11 @@ def main():
         log.info("\n=== Local Voice Windows %s (%s) ===", "diagnostics" if args.check else "setup",
                  datetime.now().isoformat(timespec="seconds"))
         try:
-            setup(args)
+            if args.remove_command:
+                from .command_install import remove_with_output
+                remove_with_output(PROJECT)
+            else:
+                setup(args)
         except (Exception, KeyboardInterrupt) as exc:
             console.failed(exc)
             raise SystemExit(1)
